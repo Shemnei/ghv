@@ -13,6 +13,21 @@ use tracing::{info, Level};
 use tracing_subscriber::FmtSubscriber;
 use walkdir::WalkDir;
 
+#[derive(Args)]
+struct Rego {
+    #[clap(long, default_value_t = String::from("ghv"))]
+    package: String,
+
+    #[clap(long, default_value_t = String::from("deny"))]
+    output: String,
+}
+
+impl Rego {
+    pub fn rule_path(&self) -> String {
+        format!("data.{}.{}", self.package, self.output)
+    }
+}
+
 #[derive(Parser)]
 #[command(author, version, about, long_about = None)] // Read from `Cargo.toml`
 struct Opts {
@@ -31,6 +46,9 @@ enum Command {
 
 #[derive(Args)]
 struct Verify {
+    #[clap(flatten)]
+    rego: Rego,
+
     #[clap(short, long, value_enum)]
     model: Model,
 
@@ -141,16 +159,15 @@ async fn handle_download(gh: Octocrab, download: Download) -> Result<()> {
 async fn handle_verify(gh: Octocrab, verify: Verify) -> Result<()> {
     let engine = {
         let mut engine = regorus::Engine::new();
-        let policy = std::fs::read_to_string(&verify.policy).unwrap();
-        engine
-            .add_policy(verify.policy.to_string_lossy().to_string(), policy)
-            .unwrap();
+        engine.add_policy_from_file(verify.policy).unwrap();
+        engine.set_rego_v1(true);
+        engine.set_strict_builtin_errors(true);
 
         engine
     };
 
     match verify.model {
-        Model::Repos => handle_verify_repos(gh, engine, verify.input).await,
+        Model::Repos => handle_verify_repos(gh, engine, verify.rego, verify.input).await,
     }
 }
 
@@ -171,7 +188,12 @@ async fn handle_verify(gh: Octocrab, verify: Verify) -> Result<()> {
 //     Ok(())
 // }
 //
-async fn handle_verify_repos(gh: Octocrab, mut engine: Engine, input: Vec<PathBuf>) -> Result<()> {
+async fn handle_verify_repos(
+    gh: Octocrab,
+    mut engine: Engine,
+    rego: Rego,
+    input: Vec<PathBuf>,
+) -> Result<()> {
     let mut repos: HashMap<octocrab::models::RepositoryId, regorus::Value> = HashMap::new();
 
     if input.is_empty() {
@@ -229,11 +251,11 @@ async fn handle_verify_repos(gh: Octocrab, mut engine: Engine, input: Vec<PathBu
     }
 
     for (id, repo) in repos {
-        println!("Evaluating repo `{id}`",);
+        println!("Evaluating repo `{id}` for `{}`", rego.rule_path());
 
         engine.set_input(repo);
 
-        let r = engine.eval_rule("data.example.deny".to_string()).unwrap();
+        let r = engine.eval_rule(rego.rule_path()).unwrap();
 
         println!(">> {r:#?}");
     }
