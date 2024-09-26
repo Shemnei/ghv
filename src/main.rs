@@ -1,14 +1,17 @@
-use std::{collections::HashMap, path::PathBuf};
+use std::{
+    collections::HashMap,
+    fs::{File, OpenOptions},
+    path::PathBuf,
+};
 
-use chrono::{DateTime, Datelike, Utc};
-use clap::{Args, Parser, Subcommand};
-use color_eyre::Result;
+use clap::{Args, Parser, Subcommand, ValueEnum};
+use color_eyre::{eyre::Ok, Result};
 use octocrab::{params, Octocrab};
 use regorus::{Engine, Value};
 use secrecy::SecretString;
-use serde_json::json;
-use tracing::{info, warn, Level};
+use tracing::{info, Level};
 use tracing_subscriber::FmtSubscriber;
+use walkdir::WalkDir;
 
 #[derive(Parser)]
 #[command(author, version, about, long_about = None)] // Read from `Cargo.toml`
@@ -23,18 +26,39 @@ struct Opts {
 #[derive(Subcommand)]
 enum Command {
     Verify(Verify),
+    Download(Download),
 }
 
 #[derive(Args)]
 struct Verify {
-    #[command(subcommand)]
+    #[clap(short, long, value_enum)]
     model: Model,
+
+    #[clap(short, long, value_parser, num_args = 0.., value_delimiter = ',')]
+    input: Vec<PathBuf>,
+
     policy: PathBuf,
 }
 
-#[derive(Subcommand)]
+#[derive(Args)]
+struct Download {
+    #[clap(short, long, value_enum)]
+    model: Model,
+
+    output: PathBuf,
+}
+
+#[derive(Debug, Clone, ValueEnum)]
 enum Model {
     Repos,
+}
+
+impl Model {
+    pub fn id(&self) -> &'static str {
+        match self {
+            Model::Repos => "repos",
+        }
+    }
 }
 
 #[tokio::main]
@@ -61,50 +85,16 @@ async fn main() -> Result<()> {
 
     match opts.command {
         Command::Verify(verify) => handle_verify(gh, verify).await,
+        Command::Download(download) => handle_download(gh, download).await,
     }
 }
 
-async fn handle_verify(gh: Octocrab, verify: Verify) -> Result<()> {
-    let engine = {
-        let mut engine = regorus::Engine::new();
-        let policy = std::fs::read_to_string(&verify.policy)?;
-        engine
-            .add_policy(verify.policy.to_string_lossy().to_string(), policy)
-            .unwrap();
-
-        engine
-    };
-
-    match verify.model {
-        Model::Repos => handle_verify_repos(gh, engine).await,
-    }
-}
-
-// async fn handle_verify_repos(gh: Octocrab, mut engine: Engine) -> Result<()> {
-//     let mock_repo: serde_json::Value = json!({
-//         "updated_at": Utc::now().with_year(2023).unwrap(),
-//     });
-//
-//     let json = serde_json::to_string_pretty(&mock_repo).unwrap();
-//     println!("{json}");
-//
-//     engine.set_input(Value::from_json_str(&json).unwrap());
-//
-//     let r = engine.eval_rule("data.example.deny".to_string()).unwrap();
-//
-//     println!(">> {r:#?}");
-//
-//     Ok(())
-// }
-//
-async fn handle_verify_repos(gh: Octocrab, mut engine: Engine) -> Result<()> {
+async fn handle_download(gh: Octocrab, download: Download) -> Result<()> {
     let orgs = gh
         .current()
         .list_org_memberships_for_authenticated_user()
         .send()
         .await?;
-
-    let mut repos = HashMap::new();
 
     for org in orgs {
         let name = org.organization.login;
@@ -126,22 +116,127 @@ async fn handle_verify_repos(gh: Octocrab, mut engine: Engine) -> Result<()> {
                 repo.full_name.as_ref().unwrap_or(&repo.name)
             );
 
-            repos.insert(repo.id, repo);
+            let path = download
+                .output
+                .join(download.model.id())
+                .join(org.organization.id.to_string())
+                .join(format!("{}.json", repo.id));
+
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+
+            let out = OpenOptions::new()
+                .write(true)
+                .truncate(true)
+                .create(true)
+                .open(path)
+                .unwrap();
+
+            serde_json::to_writer_pretty(out, &repo).unwrap();
         }
     }
 
-    for repo in repos.into_values() {
-        println!(
-            "Evaluating repo `{}`",
-            repo.full_name.as_ref().unwrap_or(&repo.name)
-        );
+    Ok(())
+}
 
-        let input = serde_json::to_string(&repo)?;
+async fn handle_verify(gh: Octocrab, verify: Verify) -> Result<()> {
+    let engine = {
+        let mut engine = regorus::Engine::new();
+        let policy = std::fs::read_to_string(&verify.policy).unwrap();
+        engine
+            .add_policy(verify.policy.to_string_lossy().to_string(), policy)
+            .unwrap();
 
-        engine.set_input(Value::from_json_str(&input).unwrap());
+        engine
+    };
+
+    match verify.model {
+        Model::Repos => handle_verify_repos(gh, engine, verify.input).await,
+    }
+}
+
+// async fn handle_verify_repos(gh: Octocrab, mut engine: Engine) -> Result<()> {
+//     let mock_repo: serde_json::Value = json!({
+//         "updated_at": Utc::now().with_year(2023).unwrap(),
+//     });
+//
+//     let json = serde_json::to_string_pretty(&mock_repo).unwrap();
+//     println!("{json}");
+//
+//     engine.set_input(Value::from_json_str(&json).unwrap());
+//
+//     let r = engine.eval_rule("data.example.deny".to_string()).unwrap();
+//
+//     println!(">> {r:#?}");
+//
+//     Ok(())
+// }
+//
+async fn handle_verify_repos(gh: Octocrab, mut engine: Engine, input: Vec<PathBuf>) -> Result<()> {
+    let mut repos: HashMap<octocrab::models::RepositoryId, regorus::Value> = HashMap::new();
+
+    if input.is_empty() {
+        let orgs = gh
+            .current()
+            .list_org_memberships_for_authenticated_user()
+            .send()
+            .await
+            .unwrap();
+
+        for org in orgs {
+            let name = org.organization.login;
+
+            println!("Scanning org `{name}`");
+
+            let org_repos = gh
+                .orgs(name)
+                .list_repos()
+                .repo_type(params::repos::Type::Sources)
+                .sort(params::repos::Sort::Pushed)
+                .direction(params::Direction::Descending)
+                .send()
+                .await
+                .unwrap();
+
+            for repo in org_repos {
+                println!(
+                    "Scanning repo `{}`",
+                    repo.full_name.as_ref().unwrap_or(&repo.name)
+                );
+
+                let json = serde_json::to_string(&repo).unwrap();
+                repos.insert(repo.id, Value::from_json_str(&json).unwrap());
+            }
+        }
+    } else {
+        for input in input {
+            for file in WalkDir::new(input)
+                .into_iter()
+                .filter_map(|e| e.ok())
+                .filter(|f| f.metadata().unwrap().is_file())
+            {
+                let repo: octocrab::models::Repository =
+                    serde_json::from_reader(File::open(file.path()).unwrap()).unwrap();
+
+                println!(
+                    "Scanning repo `{}`",
+                    repo.full_name.as_ref().unwrap_or(&repo.name)
+                );
+
+                let json = serde_json::to_string(&repo).unwrap();
+                repos.insert(repo.id, Value::from_json_str(&json).unwrap());
+            }
+        }
+    }
+
+    for (id, repo) in repos {
+        println!("Evaluating repo `{id}`",);
+
+        engine.set_input(repo);
 
         let r = engine.eval_rule("data.example.deny".to_string()).unwrap();
 
         println!(">> {r:#?}");
     }
+
+    Ok(())
 }
