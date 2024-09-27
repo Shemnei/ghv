@@ -1,3 +1,9 @@
+// TODO:
+// - Unify repo fetching (e.g. iter over all repos which can be used by download and verify)
+// - Decide on rego output (probably deny based with msgs)
+// - Decide on subset of modules to support
+// - (Rego testing support)
+
 use std::{
     collections::HashMap,
     fs::{File, OpenOptions},
@@ -6,7 +12,7 @@ use std::{
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use color_eyre::{eyre::Ok, Result};
-use octocrab::{params, Octocrab};
+use octocrab::Octocrab;
 use regorus::{Engine, Value};
 use secrecy::SecretString;
 use tracing::{info, Level};
@@ -15,16 +21,20 @@ use walkdir::WalkDir;
 
 #[derive(Args)]
 struct Rego {
-    #[clap(long, default_value_t = String::from("ghv"))]
-    package: String,
+    #[clap(long)]
+    package: Option<String>,
 
-    #[clap(long, default_value_t = String::from("deny"))]
-    output: String,
+    #[clap(long)]
+    output: Option<String>,
 }
 
 impl Rego {
-    pub fn rule_path(&self) -> String {
-        format!("data.{}.{}", self.package, self.output)
+    pub fn rule_path(&self, model: Model) -> String {
+        format!(
+            "data.{}.{}",
+            self.package.as_deref().unwrap_or(model.package_name()),
+            self.output.as_deref().unwrap_or(model.output_name())
+        )
     }
 }
 
@@ -66,6 +76,14 @@ struct Download {
     output: PathBuf,
 }
 
+trait ModelX {
+    type Output;
+
+    fn package_name(&self) -> &'static str;
+    fn output_name(&self) -> &'static str;
+    fn eval_output(&self, output: regorus::Value) -> Result<Self::Output>;
+}
+
 #[derive(Debug, Clone, ValueEnum)]
 enum Model {
     Repos,
@@ -76,6 +94,14 @@ impl Model {
         match self {
             Model::Repos => "repos",
         }
+    }
+
+    pub fn package_name(&self) -> &'static str {
+        self.id()
+    }
+
+    pub fn output_name(&self) -> &'static str {
+        "deny"
     }
 }
 
@@ -108,49 +134,43 @@ async fn main() -> Result<()> {
 }
 
 async fn handle_download(gh: Octocrab, download: Download) -> Result<()> {
-    let orgs = gh
-        .current()
-        .list_org_memberships_for_authenticated_user()
-        .send()
-        .await?;
+    let all_repos = gh
+        .all_pages(
+            gh.current()
+                .list_repos_for_authenticated_user()
+                .visibility("all")
+                .affiliation("owner,collaborator,organization_member")
+                // NOT ALLOWED WITH `visibility` or `affiliation` .type_("all")
+                .sort("updated")
+                .direction("desc")
+                .send()
+                .await
+                .unwrap(),
+        )
+        .await
+        .unwrap();
 
-    for org in orgs {
-        let name = org.organization.login;
+    for repo in all_repos {
+        println!(
+            "Scanning repo `{}`",
+            repo.full_name.as_ref().unwrap_or(&repo.name)
+        );
 
-        println!("Scanning org `{name}`");
+        let path = download
+            .output
+            .join(download.model.id())
+            .join(format!("{}.json", repo.id));
 
-        let org_repos = gh
-            .orgs(name)
-            .list_repos()
-            .repo_type(params::repos::Type::Sources)
-            .sort(params::repos::Sort::Pushed)
-            .direction(params::Direction::Descending)
-            .send()
-            .await?;
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
 
-        for repo in org_repos {
-            println!(
-                "Scanning repo `{}`",
-                repo.full_name.as_ref().unwrap_or(&repo.name)
-            );
+        let out = OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .create(true)
+            .open(path)
+            .unwrap();
 
-            let path = download
-                .output
-                .join(download.model.id())
-                .join(org.organization.id.to_string())
-                .join(format!("{}.json", repo.id));
-
-            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-
-            let out = OpenOptions::new()
-                .write(true)
-                .truncate(true)
-                .create(true)
-                .open(path)
-                .unwrap();
-
-            serde_json::to_writer_pretty(out, &repo).unwrap();
-        }
+        serde_json::to_writer_pretty(out, &repo).unwrap();
     }
 
     Ok(())
@@ -171,63 +191,40 @@ async fn handle_verify(gh: Octocrab, verify: Verify) -> Result<()> {
     }
 }
 
-// async fn handle_verify_repos(gh: Octocrab, mut engine: Engine) -> Result<()> {
-//     let mock_repo: serde_json::Value = json!({
-//         "updated_at": Utc::now().with_year(2023).unwrap(),
-//     });
-//
-//     let json = serde_json::to_string_pretty(&mock_repo).unwrap();
-//     println!("{json}");
-//
-//     engine.set_input(Value::from_json_str(&json).unwrap());
-//
-//     let r = engine.eval_rule("data.example.deny".to_string()).unwrap();
-//
-//     println!(">> {r:#?}");
-//
-//     Ok(())
-// }
-//
 async fn handle_verify_repos(
     gh: Octocrab,
     mut engine: Engine,
     rego: Rego,
     input: Vec<PathBuf>,
 ) -> Result<()> {
-    let mut repos: HashMap<octocrab::models::RepositoryId, regorus::Value> = HashMap::new();
+    let mut dedup_repos: HashMap<octocrab::models::RepositoryId, regorus::Value> = HashMap::new();
 
     if input.is_empty() {
-        let orgs = gh
-            .current()
-            .list_org_memberships_for_authenticated_user()
-            .send()
+        // Self
+        let all_repos = gh
+            .all_pages(
+                gh.current()
+                    .list_repos_for_authenticated_user()
+                    .visibility("all")
+                    .affiliation("owner,collaborator,organization_member")
+                    .type_("all")
+                    .sort("updated")
+                    .direction("desc")
+                    .send()
+                    .await
+                    .unwrap(),
+            )
             .await
             .unwrap();
 
-        for org in orgs {
-            let name = org.organization.login;
+        for repo in all_repos {
+            println!(
+                "Scanning repo `{}`",
+                repo.full_name.as_ref().unwrap_or(&repo.name)
+            );
 
-            println!("Scanning org `{name}`");
-
-            let org_repos = gh
-                .orgs(name)
-                .list_repos()
-                .repo_type(params::repos::Type::Sources)
-                .sort(params::repos::Sort::Pushed)
-                .direction(params::Direction::Descending)
-                .send()
-                .await
-                .unwrap();
-
-            for repo in org_repos {
-                println!(
-                    "Scanning repo `{}`",
-                    repo.full_name.as_ref().unwrap_or(&repo.name)
-                );
-
-                let json = serde_json::to_string(&repo).unwrap();
-                repos.insert(repo.id, Value::from_json_str(&json).unwrap());
-            }
+            let json = serde_json::to_string(&repo).unwrap();
+            dedup_repos.insert(repo.id, Value::from_json_str(&json).unwrap());
         }
     } else {
         for input in input {
@@ -240,22 +237,25 @@ async fn handle_verify_repos(
                     serde_json::from_reader(File::open(file.path()).unwrap()).unwrap();
 
                 println!(
-                    "Scanning repo `{}`",
-                    repo.full_name.as_ref().unwrap_or(&repo.name)
+                    "Scanning repo `{}` (id: `{}`)",
+                    repo.full_name.as_ref().unwrap_or(&repo.name),
+                    repo.id
                 );
 
                 let json = serde_json::to_string(&repo).unwrap();
-                repos.insert(repo.id, Value::from_json_str(&json).unwrap());
+                dedup_repos.insert(repo.id, Value::from_json_str(&json).unwrap());
             }
         }
     }
 
-    for (id, repo) in repos {
-        println!("Evaluating repo `{id}` for `{}`", rego.rule_path());
+    let rule_path = rego.rule_path(Model::Repos);
+
+    for (id, repo) in dedup_repos {
+        println!("Evaluating repo `{id}` for `{rule_path}`");
 
         engine.set_input(repo);
 
-        let r = engine.eval_rule(rego.rule_path()).unwrap();
+        let r = engine.eval_rule(rule_path.clone()).unwrap();
 
         println!(">> {r:#?}");
     }
