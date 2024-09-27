@@ -1,9 +1,10 @@
 package repos
 
-deny contains { "reason": "Name too short", "context": { "name": input.name } } if {
-	count(input.name) < 5
+deny contains sprintf("Bad default branch `%s`", [input.default_branch]) {
+	input.default_branch != "main"
 }
 
-deny contains { "reason": "Name too long", "context": { "name": input.name } } if {
-	count(input.name) > 8
+deny contains sprintf("Unlicensed public repository `%s`", [input.name]) {
+	not input.license
+	not input.private
 }

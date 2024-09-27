@@ -2,6 +2,9 @@
 // - Unify repo fetching (e.g. iter over all repos which can be used by download and verify)
 // - Decide on rego output (probably deny based with msgs)
 // - Decide on subset of modules to support
+// - Build in caching (similar to download) which expires after some condidtion or can be force
+// refreshed
+// - Nicer CLI interface
 // - (Rego testing support)
 
 use std::{
@@ -250,14 +253,28 @@ async fn handle_verify_repos(
 
     let rule_path = rego.rule_path(Model::Repos);
 
-    for (id, repo) in dedup_repos {
-        println!("Evaluating repo `{id}` for `{rule_path}`");
+    for (id, repo_json) in dedup_repos {
+        let repo: octocrab::models::Repository =
+            serde_json::from_str(&repo_json.to_json_str().unwrap()).unwrap();
 
-        engine.set_input(repo);
+        print!(
+            "Evaluating repo `{}` for `{rule_path}`: ",
+            repo.full_name.unwrap_or(repo.name)
+        );
+
+        engine.set_input(repo_json);
 
         let r = engine.eval_rule(rule_path.clone()).unwrap();
 
-        println!(">> {r:#?}");
+        let out_json: serde_json::Value = serde_json::from_str(&r.to_json_str().unwrap()).unwrap();
+
+        // TODO: Scuffed
+        if out_json.as_array().unwrap().is_empty() {
+            println!("PASSED");
+        } else {
+            println!("FAILED");
+            println!("\t{}", out_json.to_string().replace("\n", "\n\t"));
+        }
     }
 
     Ok(())
